@@ -48,6 +48,9 @@ func loadConf(path string) [][]string {
 	contents := util.Must(os.ReadFile(path))
 	blankMatcher := regexp.MustCompile("^\\s*$")
 	lines := strings.Split(string(contents), "\n")
+	lines = util.Map_tt(lines, func(s string) string {
+		return strings.Split(s, "#")[0]
+	})
 	lines = util.Filter(lines, func(s string) bool {
 		return !blankMatcher.MatchString(s)
 	})

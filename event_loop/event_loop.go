@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sync"
 	"syscall"
+	"time"
 )
 
 func New() *EventLoop {
@@ -158,6 +159,8 @@ func (l *EventLoop) consumeEventsConsumeStack() {
 		if !didConsume && wip == 0 && dip == 0 {
 			break
 		}
+		// this is the difference between maxing out a core and being practically idle
+		time.Sleep(15 * time.Microsecond)
 	}
 }
 
