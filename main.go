@@ -21,9 +21,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	jobspec := loadConf(jobspecPath)
-
-	d := daemon.New(jobspec)
+	d := daemon.New(confLoader(jobspecPath))
 	ev := event_loop.New()
 	d.Ev = ev
 	d.RegisterListeners()
@@ -31,6 +29,7 @@ func main() {
 	ev.Dispatch(string(daemon.IntervalSelfCheck))
 	ev.Dispatch(string(daemon.IntervalKeepAlive))
 	ev.Dispatch(string(daemon.IntervalDisplay))
+	ev.Dispatch(string(daemon.IntervalSelUpdateToNewJobDesc))
 	ev.Dispatch(string(daemon.Display))
 
 	go func() { ev.Run() }()
@@ -44,23 +43,30 @@ func usage() {
 	}, "\n"))
 }
 
-func loadConf(path string) [][]string {
-	contents := util.Must(os.ReadFile(path))
-	blankMatcher := regexp.MustCompile("^\\s*$")
-	lines := strings.Split(string(contents), "\n")
-	lines = util.Map_tt(lines, func(s string) string {
-		return strings.Split(s, "#")[0]
-	})
-	lines = util.Filter(lines, func(s string) bool {
-		return !blankMatcher.MatchString(s)
-	})
-	var cmds [][]string
-	cmds = util.Map_tu(lines, func(line string) []string {
-		tokens := strings.Split(line, " ")
-		tokens = util.Filter(tokens, func(s string) bool {
-			return len(s) > 0
+func confLoader(confPath string) func() ([][]string, error) {
+	return func() ([][]string, error) {
+		contents, err := os.ReadFile(confPath)
+		if err != nil {
+			return nil, err
+		}
+
+		blankMatcher := regexp.MustCompile("^\\s*$")
+		lines := strings.Split(string(contents), "\n")
+		lines = util.Map_tt(lines, func(s string) string {
+			return strings.Split(s, "#")[0]
 		})
-		return tokens
-	})
-	return cmds
+		lines = util.Filter(lines, func(s string) bool {
+			return !blankMatcher.MatchString(s)
+		})
+		var cmds [][]string
+		cmds = util.Map_tu(lines, func(line string) []string {
+			tokens := strings.Split(line, " ")
+			tokens = util.Filter(tokens, func(s string) bool {
+				return len(s) > 0
+			})
+			return tokens
+		})
+
+		return cmds, nil
+	}
 }
