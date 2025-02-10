@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -18,14 +19,9 @@ const (
 	mutexKeyJobCreation = "job-creation"
 )
 
-type JobInAction struct {
-	Cmd *exec.Cmd
-}
-
 type JobDefinition struct {
 	CmdStr  string
 	Args    []string
-	Env     map[string]string
 	ExecCmd *exec.Cmd
 	ActionsUp
 }
@@ -67,7 +63,10 @@ func (j *JobDefinition) InitJob() {
 	err := cmd.Start()
 
 	// when cmd.Wait() completes, j.ExecCmd.ProcessState will be attached
-	go func() { cmd.Wait(); j.Dispatch(string(Display)) }()
+	go func() {
+		cmd.Wait()
+		j.Dispatch(string(Display))
+	}()
 
 	if err != nil {
 		fmt.Println("that's bad")
@@ -76,12 +75,14 @@ func (j *JobDefinition) InitJob() {
 }
 
 type Daemon struct {
-	Ev ActionsUp
-	//portAvailability map[int]bool
+	Ev                 ActionsUp
 	Jobs               []*JobDefinition
+	AbandonedJobs      []*JobDefinition
 	lastReport, report string
 	shutdownMut        *sync.Mutex
 	util.MultiMutex
+	loadJobSpec         func() ([][]string, error)
+	currentJobSpecLines [][]string
 }
 
 func (d *Daemon) Exit(code int8) {
@@ -112,21 +113,25 @@ type ActionsUp interface {
 	Exit(code int8)
 }
 
-func New(cmdLines [][]string) *Daemon {
+func New(loadJobSpec func() ([][]string, error)) *Daemon {
 	d := &Daemon{
 		shutdownMut: &sync.Mutex{},
 		MultiMutex:  util.NewMultiMutex(),
 	}
+	d.loadJobSpec = loadJobSpec
+	cmdLines := util.Must(loadJobSpec())
+	d.currentJobSpecLines = cmdLines
 	jobs := d.JobSpec(cmdLines)
 	d.Jobs = jobs
 	return d
 }
 
 const (
-	Display           = EventString("display")
-	IntervalDisplay   = EventString("interval-display")
-	IntervalKeepAlive = EventString("interval-keep-alive")
-	IntervalSelfCheck = EventString("interval-self-check")
+	Display                       = EventString("display")
+	IntervalDisplay               = EventString("interval-display")
+	IntervalKeepAlive             = EventString("interval-keep-alive")
+	IntervalSelfCheck             = EventString("interval-self-check")
+	IntervalSelUpdateToNewJobDesc = EventString("interval-self-update-to-new-job-desc")
 )
 
 type EventString string
@@ -144,42 +149,55 @@ func (d *Daemon) DisplayDebug() {
 		Args   []string
 	}
 	var xx []string
-	xx = util.Map_tu(d.Jobs, func(j *JobDefinition) string {
-		status := j.Status()
+	var makeReport = func(jobs []*JobDefinition) string {
+		xx = util.Map_tu(jobs, func(j *JobDefinition) string {
+			status := j.Status()
 
-		view := miniDef{
-			Status: status,
-			Id:     0,
-			Cmd:    j.CmdStr,
-			Args:   j.Args,
-		}
-
-		switch status {
-		case "missing":
-			view.Id = -1
-		case "running":
-			view.Id = -2
-			if j.ExecCmd != nil &&
-				j.ExecCmd.Process != nil {
-				view.Id = j.ExecCmd.Process.Pid
+			view := miniDef{
+				Status: status,
+				Id:     0,
+				Cmd:    j.CmdStr,
+				Args:   j.Args,
 			}
-		case "exited":
-			if j.ExecCmd != nil &&
-				j.ExecCmd.Process != nil {
-				view.Id = j.ExecCmd.Process.Pid
+
+			switch status {
+			case "missing":
+				view.Id = -1
+			case "running":
+				view.Id = -2
+				if j.ExecCmd != nil &&
+					j.ExecCmd.Process != nil {
+					view.Id = j.ExecCmd.Process.Pid
+				}
+			case "exited":
+				if j.ExecCmd != nil &&
+					j.ExecCmd.Process != nil {
+					view.Id = j.ExecCmd.Process.Pid
+				}
+			default:
+				panic("implement me: " + status)
 			}
-		default:
-			panic("implement me: " + status)
-		}
 
-		s, err := json.Marshal(view)
-		if err != nil {
-			return err.Error()
-		}
-		return string(s)
-	})
+			s, err := json.Marshal(view)
+			if err != nil {
+				return err.Error()
+			}
+			return string(s)
+		})
+		return strings.Join(xx, "\n")
+	}
+	clearedHeader := ""
+	if len(d.AbandonedJobs) != 0 {
+		clearedHeader = "====cleared jobs===="
+	}
+	report := fmt.Sprintf(
+		"=====in progress====\n%v\n%s\n%v",
+		makeReport(d.Jobs),
+		clearedHeader,
+		makeReport(d.AbandonedJobs),
+	)
+	d.report = report
 
-	d.report = strings.Join(xx, "\n")
 	if d.report != d.lastReport {
 		fmt.Println("pid", os.Getpid())
 		fmt.Println(d.report)
@@ -194,7 +212,6 @@ func (d *Daemon) JobSpec(cmdLines [][]string) (jobs []*JobDefinition) {
 		job := JobDefinition{
 			CmdStr:    cmd,
 			Args:      args,
-			Env:       nil,
 			ActionsUp: d,
 		}
 		jobs = append(jobs, &job)
@@ -214,7 +231,7 @@ func (d *Daemon) FixMissing() {
 func (d *Daemon) RegisterListeners() {
 	d.AddListener(IntervalDisplay, func(ctx context.Context) error {
 		d.DisplayDebug()
-		time.Sleep(5000 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		d.Ev.Dispatch(string(IntervalDisplay))
 		return nil
 	})
@@ -239,22 +256,75 @@ func (d *Daemon) RegisterListeners() {
 		return nil
 	})
 
+	var stopJobBlocking = func(job *JobDefinition, extraDesc string) {
+		if job.ExecCmd != nil &&
+			job.ExecCmd.Process != nil {
+			fmt.Println("killing", extraDesc, job.ExecCmd.Process.Pid)
+			err := job.ExecCmd.Process.Kill()
+			if err != nil &&
+				err.Error() != "os: process already finished" {
+				fmt.Println("trouble killing")
+				fmt.Println(reflect.TypeOf(err))
+				fmt.Println(err.Error())
+			}
+		}
+	}
+
+	var UpdateToNewJobDesc = func() {
+		// don't start or mutate jobs when determining if we need to totally change what jobs are running
+		d.LockOn(mutexKeyJobCreation, func() {
+			newJobSpecLines, err := d.loadJobSpec()
+			if err != nil {
+				fmt.Println("Error updating jobspec!!")
+				fmt.Println(err.Error())
+				return
+			}
+			newJobSpec := d.JobSpec(newJobSpecLines)
+
+			if !reflect.DeepEqual(newJobSpecLines, d.currentJobSpecLines) {
+				d.currentJobSpecLines = newJobSpecLines
+				oldJobSpec := d.Jobs
+				toKeep, toRemove, toAdd := describeDiff(slices.Clone(newJobSpec), slices.Clone(oldJobSpec))
+				fmt.Println("remove", toRemove)
+				fmt.Println("add", util.Map_tu(toAdd, func(jd *JobDefinition) string {
+					return fmt.Sprintf("%v %v", jd.CmdStr, jd.Args)
+				}))
+
+				d.AbandonedJobs = []*JobDefinition{}
+				if len(toKeep) != len(newJobSpec) || len(toRemove) != 0 || len(toAdd) != 0 {
+					for _, entry := range toRemove {
+						toRemove := d.Jobs[entry.index]
+						stopJobBlocking(toRemove, "(extra after conf load)")
+						d.Jobs[entry.index] = nil
+						d.AbandonedJobs = append(d.AbandonedJobs, toRemove)
+					}
+
+					d.Jobs = util.Filter(d.Jobs, func(job *JobDefinition) bool {
+						return job != nil
+					})
+
+					for _, newJob := range toAdd {
+						d.Jobs = append(d.Jobs, newJob)
+					}
+				}
+				d.currentJobSpecLines = newJobSpecLines
+			}
+		})
+	}
+
+	d.AddListener(IntervalSelUpdateToNewJobDesc, func(ctx context.Context) error {
+		UpdateToNewJobDesc()
+		time.Sleep(150 * time.Millisecond)
+		d.Ev.Dispatch(string(IntervalSelUpdateToNewJobDesc))
+		return nil
+	})
+
 	d.AddListener(event_loop.Signal, func(ctx context.Context) error {
 		// block job creation while shutting down
 		d.LockOn(mutexKeyJobCreation, func() {
 			d.shutdownMut.Lock()
 			for i, job := range d.Jobs {
-				if job.ExecCmd != nil &&
-					job.ExecCmd.Process != nil {
-					fmt.Println("killing", i, job.ExecCmd.Process.Pid)
-					err := job.ExecCmd.Process.Kill()
-					if err != nil &&
-						err.Error() != "os: process already finished" {
-						fmt.Println("trouble killing")
-						fmt.Println(reflect.TypeOf(err))
-						fmt.Println(err.Error())
-					}
-				}
+				stopJobBlocking(job, fmt.Sprintf("%v", i))
 			}
 			time.Sleep(20 * time.Millisecond)
 			d.Ev.(*event_loop.EventLoop).ExitBlocking(0)
@@ -262,4 +332,50 @@ func (d *Daemon) RegisterListeners() {
 		return nil
 	})
 
+}
+
+type sliceEntry[T any] struct {
+	index int
+	t     T
+}
+
+type compare struct {
+	Cmd  string
+	Args []string
+}
+
+func describeDiff(newJobs, oldJobs []*JobDefinition) (toKeep []sliceEntry[compare], toRemove []sliceEntry[compare], toAdd []*JobDefinition) {
+	for i, j := range oldJobs {
+		found := -1
+		for ii, jj := range newJobs {
+			if jj != nil && reflect.DeepEqual(compare{
+				Cmd:  j.CmdStr,
+				Args: j.Args,
+			}, compare{
+				Cmd:  jj.CmdStr,
+				Args: jj.Args,
+			}) {
+				found = ii
+				break
+			}
+		}
+		if found > -1 {
+			newJobs[found] = nil
+			toKeep = append(toKeep, sliceEntry[compare]{i, compare{
+				Cmd:  j.CmdStr,
+				Args: j.Args,
+			}})
+		} else {
+			toRemove = append(toRemove, sliceEntry[compare]{i, compare{
+				Cmd:  j.CmdStr,
+				Args: j.Args,
+			}})
+		}
+	}
+	for _, j := range newJobs {
+		if j != nil {
+			toAdd = append(toAdd, j)
+		}
+	}
+	return
 }
